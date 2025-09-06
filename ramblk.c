@@ -6,16 +6,62 @@
 #include <9p.h>
 #include <pool.h>
 
+typedef struct {
+	uchar *buf;
+	ulong size;
+} Ram;
+
+static File *data;
+static File *ctl;
+
 void
 fsread(Req *r)
 {
-	respond(r, nil);
+	if(r->fid->file == data)
+	{
+		long off;
+		long cnt;
+		Ram *ram;
+
+		off = r->ifcall.offset;
+		cnt = r->ifcall.count;
+		ram = r->fid->file->aux;
+		if(off >= ram->size)
+			cnt = 0;
+		else if(off + cnt > ram->size)
+			cnt = ram->size - off;
+
+		memmove(r->ofcall.data, ram->buf + off, cnt);
+		r->ofcall.count = cnt;
+		respond(r, nil);
+		return;
+	}
+	respond(r, "unknown file");
 }
 
 void
 fswrite(Req *r)
 {
-	respond(r, nil);
+	if(r->fid->file == data)
+	{
+		long off;
+		long cnt;
+		Ram *ram;
+
+		off = r->ifcall.offset;
+		cnt = r->ifcall.count;
+		ram = r->fid->file->aux;
+		if(off >= ram->size)
+			cnt = 0;
+		else if(off + cnt > ram->size)
+			cnt = ram->size - off;
+
+		memmove(ram->buf + off, r->ifcall.data, cnt);
+		r->ofcall.count = cnt;
+		respond(r, nil);
+		return;
+	}
+	respond(r, "unknown file");
 }
 
 void
@@ -31,36 +77,25 @@ fsremove(Req *r)
 }
 
 void
-fsopen(Req *r)
-{
-	respond(r, nil);
-}
-
-void
-fsattach(Req *r)
-{
-	print("OK\n");
-	respond(r, nil);
-}
-
-void
 fsstart(Srv *s)
 {
 	File *root;
+	Ram *dataRam;
 
-	root = s->tree;
-	root = alloctree(nil, nil, 0777 | DMDIR, nil);
-	createfile(root, "data", getuser(), 0664, nil);
-	createfile(root, "ctl", getuser(), 0660, nil);
+	s->tree = alloctree(nil, nil, 0777 | DMDIR, nil);
+	root = s->tree->root;
+	dataRam = malloc(sizeof *dataRam);
+	dataRam->size = 1024 * 1024 * 128;
+	dataRam->buf = malloc(dataRam->size);
+	data = createfile(root, "data", nil, 0664, dataRam);
+	ctl = createfile(root, "ctl", nil, 0660, nil);
 }
 
 Srv fs = {
-	.open=		fsopen,
 	.read=		fsread,
 	.write=		fswrite,
 	.create=	fscreate,
 	.remove=	fsremove,
-	.attach=	fsattach,
 	.start=		fsstart
 };
 

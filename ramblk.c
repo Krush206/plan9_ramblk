@@ -13,8 +13,8 @@ typedef struct {
 	ulong size;
 } Ram;
 
-static char Einvctl[] = "invalid control";
-static char Eunkfile[] = "unknown file";
+static char Einvalid[] = "invalid control";
+static char Eunknown[] = "unknown file";
 static char Eperm[] = "permission denied";
 
 static File *data;
@@ -28,14 +28,14 @@ fsread(Req *r)
 	f = r->fid->file;
 	if(f == data)
 	{
-		long offset;
-		long count;
+		vlong offset;
+		u32int count;
 		Ram *ram;
 
 		offset = r->ifcall.offset;
 		count = r->ifcall.count;
 		ram = f->aux;
-		if(offset + count > ram->size)
+		if(offset + count > ram->size || count == 0)
 		{
 			r->ofcall.count = 0;
 			respond(r, nil);
@@ -53,7 +53,7 @@ fsread(Req *r)
 		respond(r, nil);
 		return;
 	}
-	respond(r, Eunkfile);
+	respond(r, Eunknown);
 }
 
 static void
@@ -64,14 +64,14 @@ fswrite(Req *r)
 	f = r->fid->file;
 	if(f == data)
 	{
-		long offset;
-		long count;
+		vlong offset;
+		u32int count;
 		Ram *ram;
 
 		offset = r->ifcall.offset;
 		count = r->ifcall.count;
 		ram = f->aux;
-		if(offset + count > ram->size)
+		if(offset + count > ram->size || count == 0)
 		{
 			r->ofcall.count = 0;
 			respond(r, nil);
@@ -85,17 +85,17 @@ fswrite(Req *r)
 	}
 	if(f == ctl)
 	{
-		char count[8];
-		char value[8];
+		char fmt[8];
+		char val[8];
 		Ram *ram;
 
 		if(r->ifcall.count >= sizeof count || r->ifcall.count == 0)
-			goto Invctl;
+			goto Invalid;
 		ram = f->aux;
-		sprintf(count, "%%.%lds", r->ifcall.count);
-		sprintf(value, count, r->ifcall.data);
-		if(sscanf(value, "%lu", &ram->size) <= 0)
-			goto Invctl;
+		sprintf(fmt, "%%.%us", r->ifcall.count);
+		sprintf(val, fmt, r->ifcall.data);
+		if(sscanf(val, "%lu", &ram->size) <= 0)
+			goto Invalid;
 		free(ram->buf);
 		ram->size = 1024 * 1024 * ram->size;
 		ram->buf = calloc(1, ram->size);
@@ -104,10 +104,10 @@ fswrite(Req *r)
 		respond(r, nil);
 		return;
 	}
-	respond(r, Eunkfile);
+	respond(r, Eunknown);
 	return;
-Invctl:
-	respond(r, Einvctl);
+Invalid:
+	respond(r, Einvalid);
 }
 
 static void

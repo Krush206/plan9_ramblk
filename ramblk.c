@@ -34,7 +34,7 @@ fsread(Req *r)
 
 		offset = r->ifcall.offset;
 		count = r->ifcall.count;
-		ram = r->fid->file->aux;
+		ram = f->aux;
 		if(offset + count > ram->size)
 		{
 			r->ofcall.count = 0;

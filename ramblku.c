@@ -150,7 +150,7 @@ fsread(Req *r)
 	ulong bs;
 	ulong be;
 	uchar *buf;
-	ulong *blk;
+	uchar *blk;
 
 	f = r->fid->file;
 	if(f == data)

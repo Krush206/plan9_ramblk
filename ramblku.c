@@ -5,28 +5,39 @@
 #include <9p.h>
 
 #include <stdio.h>
+#include <ctype.h>
+#include <fcntl.h>
 #include <zlib.h>
 
-#define BLKSZ 4096	/* uncompressed block size */
+#define SWAP_MAGIC		"SWAPSPACE2"
+#define SWAP_MAGIC_LEN	10
+#define SWAP_PAGE_SIZE	4096
+
+#define CPAGESIZE		4096
+#define CPAGEMAX		8192	/* safely above compressBound(4096) */
+
+typedef struct {
+	ulong csize;	/* compressed size, 0 if page unwritten (all zeros) */
+	ulong off;	/* offset in cbuf */
+	int uncomp;	/* 1 if stored uncompressed (raw page) */
+} CPage;
+
+typedef struct {
+	uchar *data;	/* full uncompressed data (compress off) */
+	uchar *scratch;	/* one-page scratch (compress on) */
+	uchar *cbuf;	/* compressed storage (compress on) */
+	CPage *cpages;	/* page table (compress on) */
+	ulong npages;	/* logical page count */
+	ulong size;	/* logical/uncompressed size */
+	int swap;
+	int compress;
+	Lock lk;
+} Ram;
 
 static char Einvalid[] = "invalid control";
 static char Eunknown[] = "unknown file";
 static char Eperm[] = "permission denied";
 static char Enomem[] = "out of memory";
-static char Erange[] = "offset out of range";
-
-typedef struct {
-	uchar *cbuf;	/* compressed block, nil iff all zeros */
-	ulong csize;	/* valid compressed bytes */
-} Blk;
-
-typedef struct {
-	Blk *blks;	/* block table */
-	ulong nblks;	/* number of allocated blocks */
-	ulong dsize;	/* uncompressed logical size (highwater) */
-	ulong cap;	/* uncompressed capacity (bytes) */
-	Lock lk;	/* guards all above */
-} Ram;
 
 static File *data;
 static File *ctl;
@@ -37,210 +48,212 @@ threadmaybackground(void)
 	return 1;
 }
 
-/* compress src[0:srclen] into a freshly malloc'd buffer (*dstp),
- * return compressed length */
-static ulong
-deflatemem(uchar *src, ulong srclen, uchar **dstp)
-{
-	uLongf dstlen;
-	int ret;
-
-	if(srclen == 0)
-	{
-		*dstp = nil;
-		return 0;
-	}
-	dstlen = compressBound(srclen);
-	*dstp = malloc(dstlen);
-	if(*dstp == nil)
-		return 0;
-	ret = compress(*dstp, &dstlen, src, srclen);
-	if(ret != Z_OK)
-	{
-		free(*dstp);
-		*dstp = nil;
-		return 0;
-	}
-	return dstlen;
-}
-
-/* inflate src[0:srclen] into a fresh dstlen-byte buffer;
- * return dstlen, or 0 on error */
-static ulong
-inflatemem(uchar *src, ulong srclen, ulong dstlen, uchar **dstp)
-{
-	uLongf dlen;
-	int ret;
-
-	*dstp = malloc(dstlen ? dstlen : 1);
-	if(*dstp == nil)
-		return 0;
-	if(srclen == 0)
-	{
-		memset(*dstp, 0, dstlen ? dstlen : 1);
-		return dstlen;
-	}
-	dlen = dstlen ? dstlen : 1;
-	ret = uncompress(*dstp, &dlen, src, srclen);
-	if(ret != Z_OK)
-	{
-		free(*dstp);
-		*dstp = nil;
-		return 0;
-	}
-	return dlen;
-}
-
-/* grow block table so index lastidx is valid */
+/* read n bytes from /dev/urandom */
 static int
-blkgrow(Ram *ram, ulong lastidx)
+readurandom(uchar *buf, int n)
 {
-	Blk *nb;
-	ulong oldn;
+	int fd, nread;
 
-	if(lastidx < ram->nblks)
-		return 1;
-	oldn = ram->nblks;
-	nb = realloc(ram->blks, (lastidx + 1) * sizeof *nb);
-	if(nb == nil)
-		return 0;
-	ram->blks = nb;
-	while(oldn <= lastidx)
-	{
-		ram->blks[oldn].cbuf = nil;
-		ram->blks[oldn].csize = 0;
-		oldn++;
-	}
-	ram->nblks = lastidx + 1;
-	return 1;
+	fd = open("/dev/urandom", OREAD);
+	if(fd < 0)
+		return -1;
+	nread = read(fd, buf, n);
+	close(fd);
+	return nread == n ? 0 : -1;
 }
 
-/* inflate block i into a fresh BLKSZ buffer; nil iff error */
-static uchar *
-blkinflate(Ram *ram, ulong i)
+/* decompress logical page p into scratch (one full page) */
+static int
+decompresspage(Ram *ram, ulong p, uchar *scratch)
 {
-	uchar *buf;
+	CPage *cp;
+	ulong len;
 
-	buf = malloc(BLKSZ);
-	if(buf == nil)
-		return nil;
-	if(ram->blks[i].cbuf == nil)
+	cp = &ram->cpages[p];
+	if(cp->csize == 0)
 	{
-		memset(buf, 0, BLKSZ);
-		return buf;
+		memset(scratch, 0, CPAGESIZE);
+		return 0;
 	}
-	if(inflatemem(ram->blks[i].cbuf, ram->blks[i].csize, BLKSZ, &buf) == 0)
+	if(cp->uncomp)
 	{
-		free(buf);
-		return nil;
+		memcpy(scratch, ram->cbuf + cp->off, CPAGESIZE);
+		return 0;
 	}
-	return buf;
+	len = CPAGESIZE;
+	if(uncompress(scratch, &len, ram->cbuf + cp->off, cp->csize) != Z_OK)
+		return -1;
+	return 0;
+}
+
+/* compress scratch (one full page) into logical page p */
+static int
+compresspage(Ram *ram, ulong p, uchar *scratch)
+{
+	CPage *cp;
+	ulong len;
+
+	cp = &ram->cpages[p];
+	len = CPAGEMAX;
+	if(compress2(ram->cbuf + cp->off,
+		     &len,
+		     scratch,
+		     CPAGESIZE,
+		     Z_BEST_SPEED) != Z_OK)
+		return -1;
+	cp->csize = len;
+	cp->uncomp = 0;
+	return 0;
+}
+
+/* store src uncompressed into logical page p (used for swap header page) */
+static void
+storepageuncomp(Ram *ram, ulong p, uchar *src)
+{
+	CPage *cp;
+
+	cp = &ram->cpages[p];
+	memcpy(ram->cbuf + cp->off, src, CPAGESIZE);
+	cp->csize = CPAGESIZE;
+	cp->uncomp = 1;
+}
+
+/* write a Linux swap v1 header at page 0 */
+static int
+writeswapheader(Ram *ram)
+{
+	uchar header[SWAP_PAGE_SIZE];
+	int pages;
+	int ver;
+	int lastpage;
+	int firstpage;
+
+	if(ram->size < SWAP_PAGE_SIZE)
+		return -1;
+
+	memset(header, 0, SWAP_PAGE_SIZE);
+
+	/* version = 1 at offset 1024 */
+	ver = 1;
+	memcpy(header + 1024, &ver, 4);
+
+	/* page counts at offsets 1028/1032 */
+	pages = ram->size / SWAP_PAGE_SIZE;
+	lastpage = pages - 1;
+	firstpage = 0;
+	memcpy(header + 1028, &lastpage, 4);
+	memcpy(header + 1032, &firstpage, 4);
+
+	/* uuid (16 bytes) at offset 1036 */
+	if(readurandom(header + 1036, 16) < 0)
+		return -1;
+
+	/* volume name (32 bytes) at offset 1052 */
+	memcpy(header + 1052, "ramblk", 6);
+
+	/* magic "SWAPSPACE2" at offset 4086 */
+	memcpy(header + 4086, SWAP_MAGIC, SWAP_MAGIC_LEN);
+
+	if(ram->compress)
+		storepageuncomp(ram, 0, header);
+	else
+		memcpy(ram->data, header, SWAP_PAGE_SIZE);
+
+	return 0;
 }
 
 static void
 fsread(Req *r)
 {
 	File *f;
-	Ram *ram;
-	ulong off;
+	vlong offset;
 	ulong count;
-	ulong i;
-	ulong j;
-	ulong b;
-	ulong bs;
-	ulong be;
-	uchar *buf;
-	uchar *blk;
+	Ram *ram;
+	uchar *dst;
+	vlong cur;
+	ulong remaining;
+	ulong p;
+	ulong pgoff;
+	ulong n;
 
 	f = r->fid->file;
 	if(f == data)
 	{
 		ram = f->aux;
 		lock(&ram->lk);
-		off = r->ifcall.offset;
+		offset = r->ifcall.offset;
 		count = r->ifcall.count;
-		if(count == 0 || off >= ram->dsize)
+		if(count == 0 ||
+		   offset > ram->size ||
+		   ram->size - offset < count)
 		{
 			unlock(&ram->lk);
 			r->ofcall.count = 0;
 			respond(r, nil);
 			return;
 		}
-		if(count > ram->dsize - off)
-			count = ram->dsize - off;
-		buf = malloc(count);
-		if(buf == nil)
+
+		dst = (uchar *)r->ofcall.data;
+		cur = offset;
+		remaining = count;
+		while(remaining > 0)
 		{
-			unlock(&ram->lk);
-			respond(r, Enomem);
-			return;
-		}
-		memset(buf, 0, count);
-		i = off / BLKSZ;
-		j = (off + count - 1) / BLKSZ;
-		for(b = i; b <= j; b++)
-		{
-			if(b >= ram->nblks)
-				continue;
-			blk = blkinflate(ram, b);
-			if(blk == nil)
+			p = cur / CPAGESIZE;
+			pgoff = cur % CPAGESIZE;
+			n = remaining;
+			if(n > CPAGESIZE - pgoff)
+				n = CPAGESIZE - pgoff;
+			if(ram->compress)
 			{
-				free(buf);
-				unlock(&ram->lk);
-				respond(r, Einvalid);
-				return;
+				if(decompresspage(ram, p, ram->scratch) < 0)
+				{
+					unlock(&ram->lk);
+					respond(r, Einvalid);
+					return;
+				}
+				memcpy(dst, ram->scratch + pgoff, n);
 			}
-			bs = b * BLKSZ;
-			be = bs + BLKSZ;
-			if(off > bs)
-				bs = off;
-			if(off + count < be)
-				be = off + count;
-			if(be > ram->dsize)
-				be = ram->dsize;
-			if(be > bs)
-				memcpy(buf + (bs - off),
-				       blk + (bs - b * BLKSZ),
-				       be - bs);
-			free(blk);
+			else
+				memcpy(dst, ram->data + cur, n);
+			dst += n;
+			cur += n;
+			remaining -= n;
 		}
-		memcpy(r->ofcall.data, buf, count);
-		free(buf);
-		unlock(&ram->lk);
 		r->ofcall.count = count;
+		unlock(&ram->lk);
 		respond(r, nil);
 		return;
 	}
 	if(f == ctl)
 	{
 		char buf[64];
-		int total;
 		int n;
-		ulong off;
+		vlong avail;
 
 		ram = f->aux;
 		lock(&ram->lk);
-		off = r->ifcall.offset;
-		total = snprint(buf,
-				sizeof buf,
-				"cap %lud\nused %lud\n",
-				ram->cap,
-				ram->dsize);
-		if(total < 0)
-			total = 0;
-		if((ulong) off >= (ulong)total)
-		{
-			unlock(&ram->lk);
-			r->ofcall.count = 0;
-			respond(r, nil);
-			return;
-		}
-		n = total - off;
-		if((ulong) n > r->ifcall.count)
-			n = r->ifcall.count;
-		memcpy(r->ofcall.data, buf + off, n);
+		n = snprint(buf,
+			    sizeof buf,
+			    "cap %lud\n"
+			    "swap %d\n"
+			    "compress %d\n",
+			    ram->size,
+			    ram->swap,
+			    ram->compress);
+		if(n < 0)
+			n = 0;
+		avail = n - r->ifcall.offset;
+		if(avail < 0)
+			avail = 0;
+		if((vlong) r->ifcall.count > avail)
+			r->ofcall.count = avail;
+		else
+			r->ofcall.count = r->ifcall.count;
+		if(r->ofcall.count > 0)
+			memcpy(r->ofcall.data,
+			       buf + r->ifcall.offset,
+			       r->ofcall.count);
 		unlock(&ram->lk);
-		r->ofcall.count = n;
 		respond(r, nil);
 		return;
 	}
@@ -251,151 +264,315 @@ static void
 fswrite(Req *r)
 {
 	File *f;
-	Ram *ram;
-	ulong off;
+	vlong offset;
 	ulong count;
-	ulong newdsize;
+	Ram *ram;
+	char *ptr;
+	ulong mb;
+	uchar *src;
+	vlong cur;
+	ulong remaining;
+	ulong p;
+	ulong pgoff;
+	ulong n;
+	ulong nsize;
+	ulong npages;
 	ulong i;
-	ulong j;
-	ulong b;
-	ulong nneed;
-	ulong bs;
-	ulong be;
-	uchar *blk;
-	uchar *oldcbuf;
-	ulong oldcsize;
 
 	f = r->fid->file;
-	count = r->ifcall.count;
 	if(f == data)
 	{
 		ram = f->aux;
 		lock(&ram->lk);
-		off = r->ifcall.offset;
-		if(count == 0)
+		offset = r->ifcall.offset;
+		count = r->ifcall.count;
+		if(count == 0 ||
+		   offset > ram->size ||
+		   ram->size - offset < count)
 		{
 			unlock(&ram->lk);
 			r->ofcall.count = 0;
 			respond(r, nil);
 			return;
 		}
-		if(off > ram->cap)
+
+		src = (uchar *)r->ifcall.data;
+		cur = offset;
+		remaining = count;
+		while(remaining > 0)
 		{
-			unlock(&ram->lk);
-			respond(r, Erange);
-			return;
-		}
-		if(count > ram->cap - off)
-		{
-			unlock(&ram->lk);
-			respond(r, Erange);
-			return;
-		}
-		newdsize = ram->dsize;
-		if(off + count > newdsize)
-			newdsize = off + count;
-		nneed = (newdsize + BLKSZ - 1) / BLKSZ;
-		if(nneed > ram->nblks && !blkgrow(ram, nneed - 1))
-		{
-			unlock(&ram->lk);
-			respond(r, Enomem);
-			return;
-		}
-		i = off / BLKSZ;
-		j = (off + count - 1) / BLKSZ;
-		for(b = i; b <= j; b++)
-		{
-			blk = blkinflate(ram, b);
-			if(blk == nil)
+			p = cur / CPAGESIZE;
+			pgoff = cur % CPAGESIZE;
+			n = remaining;
+			if(n > CPAGESIZE - pgoff)
+				n = CPAGESIZE - pgoff;
+			if(ram->compress)
 			{
-				unlock(&ram->lk);
-				respond(r, Enomem);
-				return;
+				if(decompresspage(ram, p, ram->scratch) < 0)
+				{
+					unlock(&ram->lk);
+					respond(r, Einvalid);
+					return;
+				}
+				memcpy(ram->scratch + pgoff, src, n);
+				if(compresspage(ram, p, ram->scratch) < 0)
+				{
+					unlock(&ram->lk);
+					respond(r, Enomem);
+					return;
+				}
 			}
-			bs = b * BLKSZ;
-			be = bs + BLKSZ;
-			if(off > bs)
-				bs = off;
-			if(off + count < be)
-				be = off + count;
-			memcpy(blk + (bs - b * BLKSZ),
-			       r->ifcall.data + (bs - off),
-			       be - bs);
-			oldcbuf = ram->blks[b].cbuf;
-			oldcsize = ram->blks[b].csize;
-			ram->blks[b].cbuf = nil;
-			ram->blks[b].csize = 0;
-			ram->blks[b].csize = deflatemem(blk,
-							BLKSZ,
-							&ram->blks[b].cbuf);
-			if(ram->blks[b].csize == 0 && ram->blks[b].cbuf == nil)
-			{
-				/* compression failed; restore old block */
-				ram->blks[b].cbuf = oldcbuf;
-				ram->blks[b].csize = oldcsize;
-				free(blk);
-				unlock(&ram->lk);
-				respond(r, Enomem);
-				return;
-			}
-			free(oldcbuf);
-			free(blk);
+			else
+				memcpy(ram->data + cur, src, n);
+			src += n;
+			cur += n;
+			remaining -= n;
 		}
-		ram->dsize = newdsize;
-		data->dir.length = ram->cap;
-		unlock(&ram->lk);
 		r->ofcall.count = count;
+		unlock(&ram->lk);
 		respond(r, nil);
 		return;
 	}
 	if(f == ctl)
 	{
-		char *ptr;
-		ulong mb;
-		ulong newcap;
-
-		ram = f->aux;
-		lock(&ram->lk);
-		if(r->ifcall.count == 0 || r->ifcall.count >= 16)
+		if(r->ifcall.count == 0 || r->ifcall.count >= 64)
 		{
-			unlock(&ram->lk);
 			respond(r, Einvalid);
 			return;
 		}
 		ptr = malloc(r->ifcall.count + 1);
 		if(ptr == nil)
 		{
-			unlock(&ram->lk);
 			respond(r, Enomem);
 			return;
 		}
 		memcpy(ptr, r->ifcall.data, r->ifcall.count);
 		ptr[r->ifcall.count] = '\0';
-		if(sscanf(ptr, "%lu", &mb) <= 0 || mb == 0)
+
+		/* "swap" formats the beginning of data as swap */
+		if(strcmp(ptr, "swap") == 0)
 		{
 			free(ptr);
+			ram = f->aux;
+			lock(&ram->lk);
+			if(ram->size < SWAP_PAGE_SIZE)
+			{
+				unlock(&ram->lk);
+				respond(r, Einvalid);
+				return;
+			}
+			if(writeswapheader(ram) < 0)
+			{
+				unlock(&ram->lk);
+				respond(r, Enomem);
+				return;
+			}
+			ram->swap = 1;
 			unlock(&ram->lk);
-			respond(r, Einvalid);
+			r->ofcall.count = r->ifcall.count;
+			respond(r, nil);
 			return;
 		}
-		free(ptr);
-		if(mb > (~0UL / (1024 * 1024)))
+
+		/* "noswap" clears the swap flag */
+		if(strcmp(ptr, "noswap") == 0)
 		{
+			free(ptr);
+			ram = f->aux;
+			lock(&ram->lk);
+			ram->swap = 0;
 			unlock(&ram->lk);
+			r->ofcall.count = r->ifcall.count;
+			respond(r, nil);
+			return;
+		}
+
+		/* "compress" enables zlib page compression */
+		if(strcmp(ptr, "compress") == 0)
+		{
+			free(ptr);
+			ram = f->aux;
+			lock(&ram->lk);
+			if(ram->compress)
+			{
+				unlock(&ram->lk);
+				r->ofcall.count = r->ifcall.count;
+				respond(r, nil);
+				return;
+			}
+			ram->npages = (ram->size + CPAGESIZE - 1) / CPAGESIZE;
+			ram->scratch = malloc(CPAGESIZE);
+			ram->cbuf = nil;
+			ram->cpages = nil;
+			if(ram->npages > 0)
+			{
+				ram->cbuf = malloc(ram->npages * CPAGEMAX);
+				ram->cpages = malloc(ram->npages * sizeof(CPage));
+			}
+			if(ram->scratch == nil ||
+			   (ram->npages > 0 &&
+			    (ram->cbuf == nil ||
+			     ram->cpages == nil)))
+			{
+				free(ram->scratch);
+				free(ram->cbuf);
+				free(ram->cpages);
+				ram->scratch = nil;
+				ram->cbuf = nil;
+				ram->cpages = nil;
+				ram->npages = 0;
+				unlock(&ram->lk);
+				respond(r, Enomem);
+				return;
+			}
+			memset(ram->cpages, 0, ram->npages * sizeof(CPage));
+			for(i = 0; i < ram->npages; i++)
+				ram->cpages[i].off = i * CPAGEMAX;
+			for(i = 0; i < ram->npages; i++)
+			{
+				uchar *pg;
+				ulong pgsize;
+				pg = ram->data + i * CPAGESIZE;
+				pgsize = CPAGESIZE;
+				if(i * CPAGESIZE + CPAGESIZE > ram->size)
+					pgsize = ram->size - i * CPAGESIZE;
+				memset(ram->scratch, 0, CPAGESIZE);
+				memcpy(ram->scratch, pg, pgsize);
+				compresspage(ram, i, ram->scratch);
+			}
+			free(ram->data);
+			ram->data = nil;
+			ram->compress = 1;
+			unlock(&ram->lk);
+			r->ofcall.count = r->ifcall.count;
+			respond(r, nil);
+			return;
+		}
+
+		/* "nocompress" disables zlib page compression */
+		if(strcmp(ptr, "nocompress") == 0)
+		{
+			free(ptr);
+			ram = f->aux;
+			lock(&ram->lk);
+			if(!ram->compress)
+			{
+				unlock(&ram->lk);
+				r->ofcall.count = r->ifcall.count;
+				respond(r, nil);
+				return;
+			}
+			ram->data = malloc(ram->size);
+			if(ram->data == nil)
+			{
+				unlock(&ram->lk);
+				respond(r, Enomem);
+				return;
+			}
+			for(i = 0; i < ram->npages; i++)
+			{
+				uchar *pg;
+				ulong pgsize;
+				pg = ram->data + i * CPAGESIZE;
+				pgsize = CPAGESIZE;
+				if(i * CPAGESIZE + CPAGESIZE > ram->size)
+					pgsize = ram->size - i * CPAGESIZE;
+				memset(ram->scratch, 0, CPAGESIZE);
+				if(decompresspage(ram, i, ram->scratch) < 0)
+				{
+					free(ram->data);
+					ram->data = nil;
+					unlock(&ram->lk);
+					respond(r, Einvalid);
+					return;
+				}
+				memcpy(pg, ram->scratch, pgsize);
+			}
+			free(ram->scratch);
+			free(ram->cbuf);
+			free(ram->cpages);
+			ram->scratch = nil;
+			ram->cbuf = nil;
+			ram->cpages = nil;
+			ram->npages = 0;
+			ram->compress = 0;
+			unlock(&ram->lk);
+			r->ofcall.count = r->ifcall.count;
+			respond(r, nil);
+			return;
+		}
+
+		free(ptr);
+
+		/* otherwise it must be a size in MB */
+		if(sscanf(ptr, "%lu", &mb) <= 0)
+		{
 			respond(r, Einvalid);
 			return;
 		}
-		newcap = mb * 1024 * 1024;
-		for(b = 0; b < ram->nblks; b++)
-			free(ram->blks[b].cbuf);
-		free(ram->blks);
-		ram->blks = nil;
-		ram->nblks = 0;
-		ram->dsize = 0;
-		ram->cap = newcap;
-		data->dir.length = ram->cap;
+
+		if(mb > (~0UL / (1024UL * 1024UL)))
+		{
+			respond(r, Einvalid);
+			return;
+		}
+
+		ram = f->aux;
+		lock(&ram->lk);
+		nsize = mb * 1024 * 1024;
+		npages = (nsize + CPAGESIZE - 1) / CPAGESIZE;
+
+		if(ram->compress)
+		{
+			uchar *ncbuf;
+			CPage *ncpages;
+
+			ncbuf = nil;
+			ncpages = nil;
+			if(npages > 0)
+			{
+				ncbuf = realloc(ram->cbuf, npages * CPAGEMAX);
+				ncpages = realloc(ram->cpages, npages * sizeof(CPage));
+			}
+			if(npages > 0 && (ncbuf == nil || ncpages == nil))
+			{
+				unlock(&ram->lk);
+				respond(r, Enomem);
+				return;
+			}
+			if(npages > ram->npages)
+				for(i = ram->npages; i < npages; i++)
+				{
+					ncpages[i].csize = 0;
+					ncpages[i].off = i * CPAGEMAX;
+					ncpages[i].uncomp = 0;
+				}
+			ram->cbuf = ncbuf;
+			ram->cpages = ncpages;
+			ram->npages = npages;
+		}
+		else
+		{
+			uchar *ndata;
+
+			ndata = nil;
+			if(nsize > 0)
+				ndata = realloc(ram->data, nsize);
+			if(nsize > 0 && ndata == nil)
+			{
+				unlock(&ram->lk);
+				respond(r, Enomem);
+				return;
+			}
+			if(nsize > ram->size)
+				memset(ndata + ram->size, 0, nsize - ram->size);
+			ram->data = ndata;
+		}
+		ram->size = nsize;
+		data->dir.length = ram->size;
+		ram->swap = 0;
 		unlock(&ram->lk);
-		r->ofcall.count = count;
+		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
 		return;
 	}
@@ -420,6 +597,13 @@ fswstat(Req *r)
 	respond(r, nil);
 }
 
+static void
+usage(void)
+{
+	fprint(2, "usage: %s size\n", argv0);
+	threadexits("usage");
+}
+
 static Srv fs = {
 	.read=		fsread,
 	.write=		fswrite,
@@ -432,17 +616,47 @@ void
 threadmain(int argc, char *argv[])
 {
 	char *srvname;
+	char *ptr;
 	Ram *ram;
+	File *root;
+	ulong mb;
+
+	argv0 = argv[0];
+	if(argc != 2)
+		usage();
+	ptr = argv[1];
+	while(*ptr != '\0')
+		if(!isdigit(*ptr++))
+			usage();
+	ptr = argv[1];
+	if(sscanf(ptr, "%lu", &mb) <= 0 || mb == 0)
+		usage();
+	if(mb > (~0UL / (1024UL * 1024UL)))
+		usage();
 
 	ram = malloc(sizeof *ram);
 	if(ram == nil)
 		threadexits("malloc");
 	memset(ram, 0, sizeof *ram);
-	ram->cap = 16 * 1024 * 1024;	/* 16 MB default capacity */
+	ram->size = mb * 1024 * 1024;
+	ram->data = calloc(1, ram->size);
+	if(ram->data == nil)
+	{
+		free(ram);
+		threadexits("malloc");
+	}
+	ram->compress = 0;
+	ram->swap = 0;
+	ram->scratch = nil;
+	ram->cbuf = nil;
+	ram->cpages = nil;
+	ram->npages = 0;
+
 	fs.tree = alloctree(nil, nil, 0777 | DMDIR, nil);
-	data = createfile(fs.tree->root, "data", nil, 0664, ram);
-	data->dir.length = ram->cap;
-	ctl = createfile(fs.tree->root, "ctl", nil, 0660, ram);
+	root = fs.tree->root;
+	data = createfile(root, "data", nil, 0664, ram);
+	data->dir.length = ram->size;
+	ctl = createfile(root, "ctl", nil, 0660, ram);
 	srvname = "ramblk";
 	threadpostmountsrv(&fs, srvname, nil, MBEFORE);
 	threadexits(nil);
